@@ -267,31 +267,6 @@ class LaMEM_POST:
 
         return vtk_data
 
-
-    # def xarray_to_vtk(self):
-    #     """
-    #     Converts a full xarray dataset into a vtk dataset
-
-    #     :param ds: xarray dataset
-    #     :param retranspose: bool
-    #     """
-    #     # Get dims from xarray ds
-    #     Nx, Ny, Nz = len(self.ds.x), len(self.ds.y), len(self.ds.z)
-    #     # Create vtk grid
-    #     grid = vtk.vtkRectilinearGrid()
-    #     # Set vtk dims and coords
-    #     grid.SetDimensions(Nx, Ny, Nz)
-    #     # If specific ds not provided use local one
-    #     grid.SetXCoordinates(self.numpy_to_vtk_array(ds.x.values))
-    #     grid.SetYCoordinates(self.numpy_to_vtk_array(ds.y.values))
-    #     grid.SetZCoordinates(self.numpy_to_vtk_array(ds.z.values))
-    #     for data_var in self.ds.data_vars:
-    #         vtk_data = self.xarray_to_vtk_array(self.ds[data_var])
-    #         # Add values to grid
-    #         grid.GetPointData().AddArray(vtk_data)
-
-    #     return grid
-
     def add_arr_to_vtk(self, arr, fieldname, n_comp=1, type="xarray"):
         """
         Docstring for add_arr_to_vtk
@@ -874,9 +849,10 @@ class PVDIO:
              # Split into batches of at most batch_size
         batches = [filenames[i:i+batch_size] for 
                    i in range(0, len(filenames), batch_size)]
-        print("batches :", batches)
+        print("batches :", batches, flush=True)
         datasets = []
         for batch in batches:
+            print("Processing batch :", batch, flush=True)
             delayed_batch = [make_delayed(fname) for fname in batch]
             results = dask.compute(*delayed_batch)  # at most batch_size files at once
             datasets.extend(results)
@@ -1028,11 +1004,11 @@ class COMPUTE:
         arr_mean = arr.where((z < top3d) & (z > bot3d)).mean(dim='z')
         return arr_mean
     
-    def topo_iso(self, rho_p, rho_m, dLAB, thick):
+    def topo_iso(self, rho_p, rho_m, rho_s, dLAB, thick):
         topo_iso_no_norm = xr.where(
-            rho_p <= rho_m, (rho_m-rho_p)*abs(dLAB)/rho_p,
+            rho_p <= rho_m, (rho_m-rho_p)*abs(dLAB)/(rho_p-rho_s),
             xr.where(
-                rho_p > rho_m, (rho_m-rho_p)*thick/rho_m,
+                rho_p > rho_m, (rho_m-rho_p)*thick/(rho_m-rho_s),
                 0,
                     )
                 )
@@ -1079,7 +1055,7 @@ class COMPUTE:
         # Compute mean densities
         self.rho_p = self.mean_between_surf(pvd_ds.ds["density [kg.m-3]"], surface-dz, self.dLAB+dz)
 
-        topo_iso = self.topo_iso(self.rho_p, rho_m, self.dLAB, self.thick)
+        topo_iso = self.topo_iso(self.rho_p, rho_m, rho_s, self.dLAB, self.thick)
         id_comp_depth = self.compensation_depth(self.dLAB, pvd_ds, max_depth=max_depth)
         Pdyn_topo = self.Pdyn_topo(rho_m, rho_s, id_comp_depth, pvd_ds)
         stress_topo = self.stress_topo(rho_m, rho_s, id_comp_depth, pvd_ds)
@@ -1115,6 +1091,7 @@ class COMPUTE:
         if isinstance(x, (float,int)):
             # find nearest index per timestep
             idx = np.abs(ds.x - x).argmin(dim="x")
+            print("idx", idx)
             # select along x using advanced indexing
             ds = ds.isel(x=idx)
 
@@ -1127,9 +1104,10 @@ class COMPUTE:
             ds = ds.isel(z=idx)
         
         # Min and max values
-        elif isinstance(x, (tuple)):
+        elif isinstance(x, (tuple, list)):
             # find nearest index per timestep
             idx_min = np.abs(ds.x - x[0]).argmin(dim="x")
+            print("idx", idx_min)
             idx_max = np.abs(ds.x - x[1]).argmin(dim="x")
             # select along x using advanced indexing
             ds = ds.isel(x=slice(idx_min, idx_max))
@@ -1204,7 +1182,7 @@ class COMPUTE:
         return "y" if y_extent >= x_extent else "x"
 
     def extract_trench_lines(self, labels_np, x_vals, y_vals,
-                              aggregator, expected_orient):
+                              aggregator, expected_orient, dim2):
         """
         For each labeled trench, return a 1D coordinate array representing
         the trench skeleton line.
@@ -1235,10 +1213,10 @@ class COMPUTE:
             # Get dominant direction of the given trench
             orientation = self.get_orientation(sel)
 
-            if expected_orient != orientation:
-                pass
-            else:
-                continue
+            # if expected_orient != orientation and dim2==False:
+            #     pass
+            # else:
+            #     continue
 
             # Might be more understandable and clean to switch to vectorized xarray calcul
             if orientation == "y":
@@ -1262,6 +1240,8 @@ class COMPUTE:
                 # trench runs along X → for each x-slice, find median y
                 along_vals = []
                 pos_vals = []
+                print("X_Vals")
+                print(x_vals)
                 for i, xv in enumerate(x_vals):
                     col = sel[i, :]         # boolean slice along y at this x
                     if col.any():
@@ -1279,7 +1259,7 @@ class COMPUTE:
         return result, new_label-1
 
     def detect_trenches(self, ds_surf, k, min_size, aggregator, merge_distance=0,
-                        CONNECTIVITY=2, smooth=True, expected_orient=None, plot=False):
+                        CONNECTIVITY=2, smooth=True, expected_orient=None, plot=False, dim2=False):
 
         # Calculate strain rate
         strain_2d = self.extract_strain_rate(ds_surf)
@@ -1331,7 +1311,7 @@ class COMPUTE:
             t_val  = float(strain_2d.t.isel(t=ti).values)
             lbl_np = trench_labels.isel(t=ti).values    # (x, y)
             lines, n_trench = self.extract_trench_lines(lbl_np, x_vals, y_vals,
-                                        aggregator, expected_orient)
+                                        aggregator, expected_orient, dim2)
             # trench_lines[t_val] = lines
             trench_lines[ti] = lines
             trench_lines[ti]["model_time"] = t_val
@@ -1359,7 +1339,7 @@ class COMPUTE:
             plt.show()
 
 
-        return trench_lines, trench_labels
+        return trench_lines, trench_labels, strain_smooth
 
         
     def get_trench_y_bounds(self, dict_trenches, trench_id=1):
@@ -1385,14 +1365,19 @@ class COMPUTE:
     def normalize_by_trench(self, ds_surf, dict_trenches, trench_id):
         # Need to take into account if orientation is "y"
         # Extract y_bounds
-        trench_min_y, trench_max_y = self.get_trench_y_bounds(dict_trenches, trench_id=trench_id)
-        print(f"Stable y range: [{trench_min_y:.4f}, {trench_max_y:.4f}]")
-        ds_surf_slice = ds_surf.sel(y=slice(trench_min_y,trench_max_y))
+        dim2=False
+        if len(ds_surf.y)==2:
+            dim2=True
+            ds_surf_slice = ds_surf
+        else:    
+            trench_min_y, trench_max_y = self.get_trench_y_bounds(dict_trenches, trench_id=trench_id)
+            print(f"Stable y range: [{trench_min_y:.4f}, {trench_max_y:.4f}]")
+            ds_surf_slice = ds_surf.sel(y=slice(trench_min_y,trench_max_y))
 
         y_grid = ds_surf_slice.y.values   # 1D, the y coords after cutting
         t_vals = list(dict_trenches.keys())
 
-        x_trench_arr = np.full((len(t_vals), len(y_grid)), np.nan)
+        x_trench_arr = np.full((len(t_vals)), np.nan) if dim2 else np.full((len(t_vals), len(y_grid)), np.nan)
 
         valid_t = []
         for ti, t in enumerate(t_vals):
@@ -1403,28 +1388,100 @@ class COMPUTE:
             along  = info["along"]              # y values of skeleton
             pos    = info["pos"]                # x values of skeleton
 
+            if dim2 is True:
+                x_trench_arr[ti] = np.mean(along)
+                print("xtrench",x_trench_arr)
             # interpolate skeleton onto the full cut y grid
-            f = interp1d(along, pos, kind="linear",
-                        bounds_error=False, fill_value="extrapolate")
-            x_trench_arr[ti, :] = f(y_grid)
+            else:
+                f = interp1d(along, pos, kind="linear",
+                            bounds_error=False, fill_value="extrapolate")
+                x_trench_arr[ti, :] = f(y_grid)
             valid_t.append(ti)
+        print("xtrench",x_trench_arr)
 
         # Only keep timesteps where trench 1 exists
         # valid_t = list(x_trench_arr.keys())
         print(f"Keeping {len(valid_t)}/{len(t_vals)} timesteps with trench 1")
-        ds_cut = ds_surf_slice.isel(t=valid_t, z=0)
+        try:
+            ds_cut = ds_surf_slice.isel(t=valid_t, z=0)
+        except:
+            ds_cut = ds_surf_slice.isel(t=valid_t)
+        if dim2 is True:
+            x_trench = xr.DataArray(
+                np.array([x_trench_arr[t] for t in valid_t]),  # shape (t,)
+                dims=["t"],
+                coords={"t": ds_cut.t},
+                name="x_trench",
+             )
+            x_norm = (ds_cut.x - x_trench).transpose("t","x")
+            ds_norm = ds_cut.assign_coords(x=x_norm)
 
-        # Wrap as DataArray with (t, y) dims
-        x_trench = xr.DataArray(
-            np.array([x_trench_arr[t] for t in valid_t]),
-            dims=["t", "y"],
-            coords={"t": ds_cut.t, "y": y_grid},
-            name="x_trench",
-        )
-
-        x_norm = (ds_cut.x - x_trench).transpose("t","x","y")
-        ds_norm = ds_cut.assign_coords(x=x_norm)
+        else:
+            # Wrap as DataArray with (t, y) dims
+            x_trench = xr.DataArray(
+                np.array([x_trench_arr[t] for t in valid_t]),
+                dims=["t", "y"],
+                coords={"t": ds_cut.t, "y": y_grid},
+                name="x_trench",
+            )
+            x_norm = (ds_cut.x - x_trench).transpose("t","x","y")
+            ds_norm = ds_cut.assign_coords(x=x_norm)
 
         return ds_norm
 
 
+    def normalize_by_trench2(self, ds_surf, dict_trenches, trench_id):
+        trench_min_y, trench_max_y = self.get_trench_y_bounds(dict_trenches, trench_id=trench_id)
+        print(f"Stable y range: [{trench_min_y:.4f}, {trench_max_y:.4f}]")
+        ds_surf_slice = ds_surf.sel(y=slice(trench_min_y, trench_max_y))
+        dim2 = len(ds_surf_slice.y) == 2
+
+        y_grid = ds_surf_slice.y.values
+        t_vals = list(dict_trenches.keys())
+        x_trench_arr = [] if dim2 else np.full((len(t_vals), len(y_grid)), np.nan)
+
+        valid_t = []
+        for ti, t in enumerate(t_vals):
+            trenches = dict_trenches[t]
+            if trench_id not in trenches:
+                continue
+            info  = trenches[trench_id]
+            along = info["along"]
+            pos   = info["pos"]
+
+            if dim2:
+                x_trench_arr.append(np.mean(along))
+            else:
+                f = interp1d(along, pos, kind="linear",
+                            bounds_error=False, fill_value="extrapolate")
+                x_trench_arr[ti, :] = f(y_grid)
+            valid_t.append(ti)
+
+        print(f"Keeping {len(valid_t)}/{len(t_vals)} timesteps with trench {trench_id}")
+        ds_cut = ds_surf_slice.isel(t=valid_t, z=0)
+
+        x_grid = ds_cut.x.values  # shape (Nx,)
+        x_norm_grid = x_grid - x_grid.mean()  # common centered output grid
+
+        ds_list = []
+        for i, ti in enumerate(valid_t):
+            ds_t = ds_cut.isel(t=i)
+
+            if dim2:
+                x_shift = x_trench_arr[i]
+            else:
+                x_shift = float(np.mean(x_trench_arr[ti]))
+
+            x_shifted = x_grid - x_shift
+
+            # Sort by shifted x to avoid duplicate/unsorted index issues
+            sort_idx = np.argsort(x_shifted)
+            ds_t = ds_t.isel(x=sort_idx)
+            ds_t = ds_t.assign_coords(x=x_shifted[sort_idx])
+
+            # Interpolate onto the common centered grid
+            ds_t = ds_t.interp(x=x_norm_grid, kwargs={"fill_value": "extrapolate"})
+            ds_list.append(ds_t)
+
+        ds_norm = xr.concat(ds_list, dim="t")
+        return ds_norm
